@@ -47,13 +47,13 @@ class JogGUI:
         self.jog_distance = 5 
         self.jog_speed = 3000 
         
-        self.start_x = 120
-        self.start_y = 0
-        self.circle_radius = 80 
+        self.start_x = 117.5
+        self.start_y = 15
+        self.circle_radius = 90 
         self.fast_speed = 18000 
         
-        self.sensor_radius = 15.0 
-        self.raster_stepover = 30.0 
+        self.sensor_radius = 12.50 
+        self.raster_stepover = 25.0 
         
         # ==========================================
 
