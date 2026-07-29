@@ -39,6 +39,13 @@
 //                              active pair steps around the ring.
 //   S                        - stop any active orbital tilt or joint wave
 //                              and immediately return to the neutral pose.
+//   A                        - read the MMA8451 accelerometer wired to the
+//                              board's onboard I2C header (PB8 SCL / PB9
+//                              SDA). Replies "ACCEL x y z" (g's, 3 decimal
+//                              places) or "ACCEL ERR" if the sensor never
+//                              initialized. On-demand only (no continuous
+//                              streaming) so it can't collide with the
+//                              per-leg step timing in the main loop.
 //
 // MOTION NOTE: this stage moves each leg toward its target at a fixed max
 // step rate - no acceleration profile yet. Fine for a slow-moving balancing
@@ -46,6 +53,8 @@
 
 #include <Arduino.h>
 #include <SoftwareSerial.h>
+#include <Wire.h>
+#include <Adafruit_MMA8451.h>
 #include <TMCStepper.h>
 #include "kinematics.h"
 
@@ -75,6 +84,14 @@ constexpr bool HALL_ACTIVE_LOW = true;
 constexpr float R_SENSE = 0.11f;
 constexpr uint8_t DRIVER_ADDRESS = 0b00;
 constexpr uint16_t TEST_CURRENT_MA = 1200; // confirmed good running current
+
+// --- MMA8451 accelerometer, on the Octopus's onboard I2C header ---
+// PB8 = SCL, PB9 = SDA (that header's pinout on this board).
+constexpr uint8_t MMA_SCL_PIN = PB8;
+constexpr uint8_t MMA_SDA_PIN = PB9;
+constexpr float G_PER_MS2 = 1.0f / 9.80665f;
+Adafruit_MMA8451 mma = Adafruit_MMA8451();
+bool mma_ok = false;
 
 SoftwareSerial uartM0(PC4, PC4);
 SoftwareSerial uartM1(PD11, PD11);
@@ -544,6 +561,21 @@ void process_command(char* line) {
         }
         return;
     }
+    if (line[0] == 'A' || line[0] == 'a') {
+        if (!mma_ok) {
+            Serial.println("ACCEL ERR");
+            return;
+        }
+        sensors_event_t event;
+        mma.getEvent(&event);
+        Serial.print("ACCEL ");
+        Serial.print(event.acceleration.x * G_PER_MS2, 3);
+        Serial.print(' ');
+        Serial.print(event.acceleration.y * G_PER_MS2, 3);
+        Serial.print(' ');
+        Serial.println(event.acceleration.z * G_PER_MS2, 3);
+        return;
+    }
     if (line[0] == 'Q' || line[0] == 'q') {
         // Status query for external scripts (e.g. a PC-side orchestration
         // GUI) to poll instead of guessing a sleep duration - mirrors how
@@ -555,7 +587,7 @@ void process_command(char* line) {
         Serial.println(settled ? "SETTLED" : "MOVING");
         return;
     }
-    Serial.println("Unknown command. Use Z (home from hand-set vertical), H (auto-home via hall sensors), P x y z roll pitch yaw (move), W tilt_deg [period_sec] (orbit), J amplitude_deg [period_sec] (joint wave), S (stop), or Q (status query).");
+    Serial.println("Unknown command. Use Z (home from hand-set vertical), H (auto-home via hall sensors), P x y z roll pitch yaw (move), W tilt_deg [period_sec] (orbit), J amplitude_deg [period_sec] (joint wave), S (stop), Q (status query), or A (read accelerometer).");
 }
 
 void setup() {
@@ -589,6 +621,17 @@ void setup() {
         uint8_t result = drivers[i]->test_connection();
         Serial.print("Motor "); Serial.print(i);
         Serial.print(" UART test_connection(): "); Serial.println(result);
+    }
+
+    Wire.setSCL(MMA_SCL_PIN);
+    Wire.setSDA(MMA_SDA_PIN);
+    Wire.begin();
+    mma_ok = mma.begin();
+    if (mma_ok) {
+        mma.setRange(MMA8451_RANGE_2_G);
+        Serial.println("MMA8451 accelerometer found.");
+    } else {
+        Serial.println("MMA8451 accelerometer NOT found - check I2C wiring. 'A' will report ACCEL ERR.");
     }
 
     Serial.println("Ready. Send Z to home, then P x y z roll pitch yaw to move.");

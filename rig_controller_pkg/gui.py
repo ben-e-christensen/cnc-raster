@@ -98,6 +98,7 @@ class JogGUI:
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
         threading.Thread(target=self._startup_sequence, daemon=True).start()
+        threading.Thread(target=self._poll_accel_loop, daemon=True).start()
 
     # ---------------- layout ----------------
 
@@ -172,6 +173,9 @@ class JogGUI:
         tk.Button(frame, text="Home (Z - manual vertical)", command=self._platform_home).grid(row=3, column=0, columnspan=3, sticky="we")
         tk.Button(frame, text="Auto-Home (H - hall sensors)", command=self._platform_hall_home).grid(row=4, column=0, columnspan=3, sticky="we", pady=(5, 0))
         tk.Button(frame, text="Level (S)", command=lambda: self.platform.level()).grid(row=5, column=0, columnspan=3, sticky="we", pady=(5, 0))
+
+        self.accel_label = tk.Label(frame, text="Accel: -- / -- / -- g", fg="gray")
+        self.accel_label.grid(row=6, column=0, columnspan=3, pady=(10, 0))
 
     def _setup_cycle_ui(self, frame):
         tk.Label(frame, text="Wiggle tilt (deg):").grid(row=0, column=0, sticky="e")
@@ -276,6 +280,26 @@ class JogGUI:
 
     def _platform_hall_home(self):
         threading.Thread(target=self.platform.hall_home, daemon=True).start()
+
+    def _poll_accel_loop(self):
+        """Runs forever on its own background thread (serial reads are
+        blocking calls, so this can't run on the main thread). Polls the
+        MMA8451 at ~2Hz whenever the platform is connected and only hops to
+        the main thread to update the label text."""
+        while True:
+            if self.platform.connected:
+                reading = self.platform.read_accel(timeout=1.0)
+                if reading is not None:
+                    x, y, z = reading
+                    text = f"Accel: {x:.2f} / {y:.2f} / {z:.2f} g"
+                    self.root.after(0, lambda t=text: self.accel_label.config(text=t, fg="black"))
+                else:
+                    self.root.after(0, lambda: self.accel_label.config(
+                        text="Accel: -- / -- / -- g (no reading)", fg="red"))
+            else:
+                self.root.after(0, lambda: self.accel_label.config(
+                    text="Accel: -- / -- / -- g", fg="gray"))
+            time.sleep(0.5)
 
     def _on_close(self):
         """Clean shutdown: release the DAQ hardware handle, the camera, and

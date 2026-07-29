@@ -40,6 +40,10 @@ in `kinematics.h` - see that file's header comment for the full derivation.
   higher and the platform will stutter/hold at whichever phase angles push
   past the envelope, since those particular poses come back unreachable.
 - `S` - stop an active orbit and hold the current position.
+- `A` - read the MMA8451 accelerometer wired to the board's onboard I2C
+  header (PB8 = SCL, PB9 = SDA). Replies `ACCEL x y z` (g's, 3 decimals),
+  or `ACCEL ERR` if the sensor didn't initialize at boot. On-demand only -
+  polled by the PC side, not streamed continuously.
 
 You must send `Z` before any `P` or `W` command will be accepted.
 
