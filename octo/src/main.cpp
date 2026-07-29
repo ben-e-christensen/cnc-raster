@@ -25,7 +25,7 @@
 //                              swirling a marble around the rim of a bowl.
 //                              period_sec is how long one full revolution
 //                              takes (default 4s if omitted). Workspace
-//                              sweep confirms 12.0 deg is the largest radius
+//                              sweep confirms 16.5 deg is the largest radius
 //                              reachable at every point around the circle -
 //                              go higher and it'll stutter at some phases.
 //   J amplitude_deg [period_sec] - joint-space traveling wave: drives raw
@@ -56,9 +56,25 @@ constexpr uint8_t STEP_PINS[NUM_MOTORS]   = { PF13, PG0,  PF11, PG4, PF9,  PC13 
 constexpr uint8_t DIR_PINS[NUM_MOTORS]    = { PF12, PG1,  PG3,  PC1, PF10, PF0  };
 constexpr uint8_t ENABLE_PINS[NUM_MOTORS] = { PF14, PF15, PG5,  PA0, PG2,  PF1  }; // all active-low
 
+// Hall-effect homing sensors, one per leg, on the board's free DIAG/endstop
+// headers. Default order below - VERIFY against how you actually wired
+// them (swap entries if leg N's sensor is on a different header).
+// Hall-effect homing sensors, one per leg. MOVED from the DIAG/endstop
+// headers to the EXP1 header - the DIAG pins have hardware pull-up
+// circuitry baked into the board itself, which fought the sensor's own
+// pull-up and only sank the triggered voltage to ~1.6-1.8V (not a clean
+// LOW). EXP1 is plain GPIO with no display attached in this build (EXP1/
+// EXP2 are only used for an LCD panel, which we don't have), so it's free
+// and doesn't have that extra pull-up in the way. Confirmed clean 0V here.
+constexpr uint8_t HALL_PINS[NUM_LEGS] = { PE8, PE9, PE12, PE13, PE14, PE15 };
+// >>> TUNABLE: sensor polarity. Most cheap hall breakout modules pull the
+// output LOW when a magnet is present. If your bench test shows the
+// opposite (reads HIGH near the magnet), flip this to false.
+constexpr bool HALL_ACTIVE_LOW = true;
+
 constexpr float R_SENSE = 0.11f;
 constexpr uint8_t DRIVER_ADDRESS = 0b00;
-constexpr uint16_t TEST_CURRENT_MA = 600; // still conservative - raise once confirmed reliable
+constexpr uint16_t TEST_CURRENT_MA = 1200; // confirmed good running current
 
 SoftwareSerial uartM0(PC4, PC4);
 SoftwareSerial uartM1(PD11, PD11);
@@ -87,6 +103,15 @@ constexpr float STEPS_PER_RAD = STEPS_PER_REV / (2.0f * PI);
 
 constexpr uint32_t STEP_PULSE_US = 20;
 constexpr uint32_t MAX_STEP_INTERVAL_US = 2000; // max step rate per leg (500 steps/sec)
+
+// >>> TUNABLE: slower speed for big jumps (S return-to-neutral, P moves, and
+// the first snap when W/J starts), so those don't feel abrupt. Continuous
+// orbit/wave TRACKING stays at the fast rate above - each ~50Hz update only
+// moves the target a little, so it's automatically under SNAP_THRESHOLD_STEPS
+// and never uses this slower rate. Raise SNAP_STEP_INTERVAL_US for gentler
+// jumps; lower SNAP_THRESHOLD_STEPS if continuous moves start feeling slow.
+constexpr uint32_t SNAP_STEP_INTERVAL_US = 6000;  // ~167 steps/sec for big jumps
+constexpr int32_t SNAP_THRESHOLD_STEPS = 45;      // ~5 degrees of remaining travel
 
 float neutral_angle[NUM_LEGS];      // crank angle at the homed neutral pose
 float current_angle[NUM_LEGS];      // best-known current angle (from step count)
@@ -213,29 +238,224 @@ void update_jointwave() {
     }
 }
 
-void do_homing() {
-    orbit_active = false;
-    jointwave_active = false;
+// Homing, VERTICAL-REFERENCE model:
+// You physically set every horn dead VERTICAL (tip straight up) by eye - the
+// one horn angle that's easy to judge accurately. Then Z drives each leg from
+// vertical DOWN to the level home. The offset is COMPUTED at runtime from the
+// solved home angle (home_crank_angle - 90deg, since vertical = +90deg in our
+// convention), so it always matches whatever NEUTRAL_Z is set to - change
+// NEUTRAL_Z in kinematics.h and this stays correct automatically.
+//
+// The move is done SLOWLY and deliberately (HOMING_STEP_INTERVAL_US) so you
+// can watch it and hit reset if a horn turns the wrong way. If a horn rotates
+// the WRONG direction from vertical, flip HOMING_DIR_SIGN in kinematics.h.
+constexpr uint32_t HOMING_STEP_INTERVAL_US = 6000; // slow: ~167 steps/sec
+constexpr float HORN_VERTICAL_ANGLE_DEG = 90.0f;   // vertical horn = +90deg (unit-circle convention)
+
+// Shared by BOTH homing paths: assumes current_step_pos[i]==0 already means
+// "vertical" for every leg (either because you set it by hand, or because
+// do_hall_auto_homing()'s search state machine just measured it), then
+// drives slowly from there to the level home at NEUTRAL_Z. Offset is
+// computed live so it always tracks whatever NEUTRAL_Z is currently set to.
+void drive_to_level_home_from_vertical() {
     Vec3 neutral_pos(0, 0, NEUTRAL_Z);
     Mat3 identity = rotation_from_rpy_deg(0, 0, 0);
-    for (uint8_t i = 0; i < NUM_LEGS; i++) current_angle[i] = 0; // no prior reference yet
+    for (uint8_t i = 0; i < NUM_LEGS; i++) current_angle[i] = 0;
     uint8_t fail_mask = solve_all_legs(neutral_pos, identity, current_angle);
     if (fail_mask) {
-        Serial.println("ERROR: neutral pose itself failed to solve - check geometry constants.");
+        Serial.println("ERROR: neutral pose failed to solve - check geometry / NEUTRAL_Z.");
         return;
     }
+
+    Serial.println("Driving slowly to level home - watch for any horn turning the wrong way.");
     for (uint8_t i = 0; i < NUM_LEGS; i++) {
-        neutral_angle[i] = current_angle[i];
+        neutral_angle[i] = current_angle[i]; // reference for the pose solver
+        float off_rad = HOMING_DIR_SIGN * (current_angle[i] - radians(HORN_VERTICAL_ANGLE_DEG));
+        target_step_pos[i] = (int32_t) roundf(off_rad * STEPS_PER_RAD);
+    }
+
+    bool moving = true;
+    while (moving) {
+        moving = false;
+        uint32_t now = micros();
+        for (uint8_t i = 0; i < NUM_LEGS; i++) {
+            if (current_step_pos[i] == target_step_pos[i]) continue;
+            moving = true;
+            if (now - last_step_time[i] < HOMING_STEP_INTERVAL_US) continue;
+            bool forward = target_step_pos[i] > current_step_pos[i];
+            digitalWrite(DIR_PINS[i], forward ? HIGH : LOW);
+            digitalWrite(STEP_PINS[i], HIGH);
+            delayMicroseconds(STEP_PULSE_US);
+            digitalWrite(STEP_PINS[i], LOW);
+            current_step_pos[i] += forward ? 1 : -1;
+            last_step_time[i] = micros();
+        }
+    }
+
+    for (uint8_t i = 0; i < NUM_LEGS; i++) {
         current_step_pos[i] = 0;
         target_step_pos[i] = 0;
     }
     homed = true;
-    Serial.println("Homed. Neutral angles (deg):");
-    for (uint8_t i = 0; i < NUM_LEGS; i++) {
-        Serial.print("  leg "); Serial.print(i); Serial.print(": ");
-        Serial.println(degrees(neutral_angle[i]));
-    }
+    Serial.println("Homed at level position. Horn angles now (deg from horizontal):");
+    Serial.println("  legs 0/2/4 ~ -11.9, legs 1/3/5 ~ +24.4");
+    Serial.println("Ready. S or 'P 0 0 0 0 0 0' returns here.");
 }
+
+void do_homing() {
+    orbit_active = false;
+    jointwave_active = false;
+    Serial.println("Homing from VERTICAL (set by hand). Make sure all horns are straight up.");
+    // Treat wherever the horns physically are RIGHT NOW as vertical (step 0).
+    // (The hall-sensor path doesn't need this - do_hall_auto_homing()'s
+    // search state machine already zeroes current_step_pos per leg once
+    // it centers on that leg's magnet.)
+    for (uint8_t i = 0; i < NUM_LEGS; i++) current_step_pos[i] = 0;
+    drive_to_level_home_from_vertical();
+}
+
+// --- Hall-sensor auto-homing ---
+// Finds the TRUE vertical position for each leg automatically, using the
+// magnet-on-horn + hall-sensor-on-faceplate pair, instead of relying on you
+// eyeballing vertical. Since the magnet (6mm) is wider than a single step,
+// the sensor stays LOW across a RANGE of steps, not just one instant - so
+// the search finds the whole window and centers on its midpoint:
+//   1. If already inside the window at the start, back out of it first, so
+//      the search always begins from outside (avoids capturing only half
+//      the window).
+//   2. Step forward until the sensor goes LOW (entering the window).
+//   3. Keep stepping forward, counting, until it goes HIGH again (exiting).
+//   4. Step backward by half that count, landing in the middle of the
+//      window - the true magnet-center reference.
+//   5. That position becomes step 0 (vertical) for that leg.
+//
+// ALL SIX LEGS RUN THIS TOGETHER, one step at a time, round-robin - NOT one
+// leg fully finished before the next starts. Reason: this is a closed-loop
+// parallel mechanism, so if the other five legs are already sitting near
+// their correct home angle and stay frozen while just one leg gets dragged
+// through a wide sweep, the platform can't actually accommodate that (the
+// rods can't violate their fixed length) - the moving leg ends up fighting
+// the whole rigid structure and stalls. Stepping all six together, a little
+// at a time, keeps every leg's position close to the others throughout the
+// search instead of letting one wander far while five sit locked.
+constexpr uint32_t HALL_SEARCH_STEP_INTERVAL_US = 6000; // same slow pace as homing
+constexpr int32_t HALL_SEARCH_MAX_STEPS = 1200; // ~135deg safety cap per phase -
+                                                 // if exceeded, something's wrong
+                                                 // (wiring, sensitivity, no magnet)
+
+enum HallSearchState { HS_BACK_OUT, HS_SEARCH_FWD, HS_COUNT_WINDOW, HS_CENTER_BACK, HS_DONE, HS_ERROR };
+
+bool hall_triggered(uint8_t leg) {
+    bool raw = digitalRead(HALL_PINS[leg]);
+    return HALL_ACTIVE_LOW ? (raw == LOW) : (raw == HIGH);
+}
+
+// Steps one leg once, in the given direction, at the slow search pace.
+void hall_search_step(uint8_t leg, bool forward) {
+    digitalWrite(DIR_PINS[leg], forward ? HIGH : LOW);
+    digitalWrite(STEP_PINS[leg], HIGH);
+    delayMicroseconds(STEP_PULSE_US);
+    digitalWrite(STEP_PINS[leg], LOW);
+    current_step_pos[leg] += forward ? 1 : -1;
+}
+
+void do_hall_auto_homing() {
+    orbit_active = false;
+    jointwave_active = false;
+    Serial.println("Auto-homing via hall sensors - finding true vertical, all legs together...");
+
+    HallSearchState state[NUM_LEGS];
+    int32_t progress[NUM_LEGS]  = {0}; // safety-cap counter, reset each phase
+    int32_t window[NUM_LEGS]    = {0}; // steps counted across the window
+    int32_t center_left[NUM_LEGS] = {0}; // steps still to back up while centering
+
+    for (uint8_t i = 0; i < NUM_LEGS; i++) {
+        state[i] = hall_triggered(i) ? HS_BACK_OUT : HS_SEARCH_FWD;
+        progress[i] = 0;
+    }
+
+    bool any_active = true;
+    while (any_active) {
+        any_active = false;
+        for (uint8_t i = 0; i < NUM_LEGS; i++) {
+            switch (state[i]) {
+                case HS_BACK_OUT:
+                    if (!hall_triggered(i)) {
+                        state[i] = HS_SEARCH_FWD;
+                        progress[i] = 0;
+                    } else {
+                        hall_search_step(i, false);
+                        if (++progress[i] > HALL_SEARCH_MAX_STEPS) {
+                            Serial.print("ERROR leg "); Serial.print(i);
+                            Serial.println(": sensor stuck LOW, could not back out. Check wiring/polarity.");
+                            state[i] = HS_ERROR;
+                        }
+                    }
+                    break;
+
+                case HS_SEARCH_FWD:
+                    if (hall_triggered(i)) {
+                        state[i] = HS_COUNT_WINDOW;
+                        window[i] = 0;
+                        progress[i] = 0;
+                    } else {
+                        hall_search_step(i, true);
+                        if (++progress[i] > HALL_SEARCH_MAX_STEPS) {
+                            Serial.print("ERROR leg "); Serial.print(i);
+                            Serial.println(": magnet not found within search range. Check wiring/magnet/sensitivity.");
+                            state[i] = HS_ERROR;
+                        }
+                    }
+                    break;
+
+                case HS_COUNT_WINDOW:
+                    if (!hall_triggered(i)) {
+                        center_left[i] = window[i] / 2;
+                        state[i] = HS_CENTER_BACK;
+                    } else {
+                        hall_search_step(i, true);
+                        window[i]++;
+                        if (++progress[i] > HALL_SEARCH_MAX_STEPS) {
+                            Serial.print("ERROR leg "); Serial.print(i);
+                            Serial.println(": window never closed. Check wiring/polarity/magnet.");
+                            state[i] = HS_ERROR;
+                        }
+                    }
+                    break;
+
+                case HS_CENTER_BACK:
+                    if (center_left[i] <= 0) {
+                        current_step_pos[i] = 0; // vertical reference found
+                        Serial.print("Leg "); Serial.print(i);
+                        Serial.print(": magnet window = "); Serial.print(window[i]);
+                        Serial.println(" steps wide, centered.");
+                        state[i] = HS_DONE;
+                    } else {
+                        hall_search_step(i, false);
+                        center_left[i]--;
+                    }
+                    break;
+
+                case HS_DONE:
+                case HS_ERROR:
+                    break; // nothing to do this round
+            }
+            if (state[i] != HS_DONE && state[i] != HS_ERROR) any_active = true;
+        }
+        if (any_active) delayMicroseconds(HALL_SEARCH_STEP_INTERVAL_US);
+    }
+
+    for (uint8_t i = 0; i < NUM_LEGS; i++) {
+        if (state[i] == HS_ERROR) {
+            Serial.println("Auto-homing ABORTED. Fix the flagged leg(s) and try again.");
+            return;
+        }
+    }
+
+    Serial.println("All six legs centered on their magnets. Driving to level home...");
+    drive_to_level_home_from_vertical();
+}
+
 
 char cmd_buf[64];
 uint8_t cmd_len = 0;
@@ -243,6 +463,10 @@ uint8_t cmd_len = 0;
 void process_command(char* line) {
     if (line[0] == 'Z' || line[0] == 'z') {
         do_homing();
+        return;
+    }
+    if (line[0] == 'H' || line[0] == 'h') {
+        do_hall_auto_homing();
         return;
     }
     if (line[0] == 'P' || line[0] == 'p') {
@@ -320,7 +544,18 @@ void process_command(char* line) {
         }
         return;
     }
-    Serial.println("Unknown command. Use Z (home), P x y z roll pitch yaw (move), W tilt_deg [period_sec] (orbit), J amplitude_deg [period_sec] (joint wave), or S (stop).");
+    if (line[0] == 'Q' || line[0] == 'q') {
+        // Status query for external scripts (e.g. a PC-side orchestration
+        // GUI) to poll instead of guessing a sleep duration - mirrors how
+        // the CNC side already polls Klipper for position/homed state.
+        bool settled = true;
+        for (uint8_t i = 0; i < NUM_LEGS; i++) {
+            if (current_step_pos[i] != target_step_pos[i]) { settled = false; break; }
+        }
+        Serial.println(settled ? "SETTLED" : "MOVING");
+        return;
+    }
+    Serial.println("Unknown command. Use Z (home from hand-set vertical), H (auto-home via hall sensors), P x y z roll pitch yaw (move), W tilt_deg [period_sec] (orbit), J amplitude_deg [period_sec] (joint wave), S (stop), or Q (status query).");
 }
 
 void setup() {
@@ -333,6 +568,13 @@ void setup() {
         pinMode(STEP_PINS[i], OUTPUT);
         pinMode(DIR_PINS[i], OUTPUT);
         pinMode(ENABLE_PINS[i], OUTPUT);
+        pinMode(HALL_PINS[i], INPUT); // plain INPUT, NOT INPUT_PULLUP - the
+                                      // sensor board actively drives both
+                                      // states itself (~3.3V idle / 0V
+                                      // triggered), so there's no floating
+                                      // condition to protect against, and an
+                                      // internal pull-up would only add a
+                                      // second (unwanted) pull-up path
         digitalWrite(ENABLE_PINS[i], LOW);
         digitalWrite(DIR_PINS[i], LOW);
         digitalWrite(STEP_PINS[i], LOW);
@@ -382,10 +624,15 @@ void loop() {
     // --- per-leg target-seeking motion ---
     uint32_t now = micros();
     for (uint8_t i = 0; i < NUM_LEGS; i++) {
-        if (current_step_pos[i] == target_step_pos[i]) continue;
-        if (now - last_step_time[i] < MAX_STEP_INTERVAL_US) continue;
+        int32_t delta = target_step_pos[i] - current_step_pos[i];
+        if (delta == 0) continue;
+        int32_t abs_delta = (delta > 0) ? delta : -delta;
+        uint32_t interval = (abs_delta > SNAP_THRESHOLD_STEPS)
+                                 ? SNAP_STEP_INTERVAL_US
+                                 : MAX_STEP_INTERVAL_US;
+        if (now - last_step_time[i] < interval) continue;
 
-        bool forward = target_step_pos[i] > current_step_pos[i];
+        bool forward = delta > 0;
         digitalWrite(DIR_PINS[i], forward ? HIGH : LOW);
         digitalWrite(STEP_PINS[i], HIGH);
         delayMicroseconds(STEP_PULSE_US);

@@ -34,7 +34,7 @@ in `kinematics.h` - see that file's header comment for the full derivation.
   like swirling a marble around the rim of a bowl, rather than tipping the
   platform once and holding still. `period_sec` is how long one full
   revolution takes (default 4 seconds if omitted). Example: `W 10 3` orbits
-  a 10-degree tilt once every 3 seconds. **12.0 degrees is the largest tilt
+  a 10-degree tilt once every 3 seconds. **16.5 degrees is the largest tilt
   magnitude that stays reachable at every point around the full circle**,
   confirmed via `workspace_sweep.py`'s `max_safe_orbit_radius()` - go
   higher and the platform will stutter/hold at whichever phase angles push
