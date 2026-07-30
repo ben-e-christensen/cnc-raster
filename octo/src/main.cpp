@@ -83,13 +83,12 @@ constexpr bool HALL_ACTIVE_LOW = true;
 
 constexpr float R_SENSE = 0.11f;
 constexpr uint8_t DRIVER_ADDRESS = 0b00;
-constexpr uint16_t TEST_CURRENT_MA = 1200; // confirmed good running current
+constexpr uint16_t TEST_CURRENT_MA = 1500; // confirmed good running current
 
 // --- MMA8451 accelerometer, on the Octopus's onboard I2C header ---
 // PB8 = SCL, PB9 = SDA (that header's pinout on this board).
 constexpr uint8_t MMA_SCL_PIN = PB8;
 constexpr uint8_t MMA_SDA_PIN = PB9;
-constexpr float G_PER_MS2 = 1.0f / 9.80665f;
 Adafruit_MMA8451 mma = Adafruit_MMA8451();
 bool mma_ok = false;
 
@@ -474,6 +473,37 @@ void do_hall_auto_homing() {
 }
 
 
+// Raw, error-checked accelerometer read. Adafruit_MMA8451::read() (the
+// stock library call behind getEvent()) never checks whether its I2C
+// transaction actually succeeded - on failure it silently leaves its
+// buffer at the initialized {register_addr, 0, 0, 0, 0, 0}, so a flaky
+// bus (loose header pin, EMI from the TMC2209s chopping current right
+// next to these wires, etc.) produces the exact same bogus "reading"
+// forever, and getEvent() always returns true regardless. This bypasses
+// that by doing the transaction directly and only reporting success when
+// all 6 bytes genuinely came back.
+bool read_accel_checked(float &xg, float &yg, float &zg) {
+    Wire.beginTransmission(MMA8451_DEFAULT_ADDRESS);
+    Wire.write(MMA8451_REG_OUT_X_MSB);
+    if (Wire.endTransmission(false) != 0) return false; // repeated start, no stop
+
+    if (Wire.requestFrom((uint8_t)MMA8451_DEFAULT_ADDRESS, (uint8_t)6) != 6) {
+        return false;
+    }
+    uint8_t buf[6];
+    for (uint8_t i = 0; i < 6; i++) buf[i] = Wire.read();
+
+    int16_t x = buf[0]; x <<= 8; x |= buf[1]; x >>= 2;
+    int16_t y = buf[2]; y <<= 8; y |= buf[3]; y >>= 2;
+    int16_t z = buf[4]; z <<= 8; z |= buf[5]; z >>= 2;
+
+    constexpr float DIVIDER = 4096.0f; // matches MMA8451_RANGE_2_G set in setup()
+    xg = x / DIVIDER;
+    yg = y / DIVIDER;
+    zg = z / DIVIDER;
+    return true;
+}
+
 char cmd_buf[64];
 uint8_t cmd_len = 0;
 
@@ -562,18 +592,17 @@ void process_command(char* line) {
         return;
     }
     if (line[0] == 'A' || line[0] == 'a') {
-        if (!mma_ok) {
+        float xg, yg, zg;
+        if (!mma_ok || !read_accel_checked(xg, yg, zg)) {
             Serial.println("ACCEL ERR");
             return;
         }
-        sensors_event_t event;
-        mma.getEvent(&event);
         Serial.print("ACCEL ");
-        Serial.print(event.acceleration.x * G_PER_MS2, 3);
+        Serial.print(xg, 3);
         Serial.print(' ');
-        Serial.print(event.acceleration.y * G_PER_MS2, 3);
+        Serial.print(yg, 3);
         Serial.print(' ');
-        Serial.println(event.acceleration.z * G_PER_MS2, 3);
+        Serial.println(zg, 3);
         return;
     }
     if (line[0] == 'Q' || line[0] == 'q') {
