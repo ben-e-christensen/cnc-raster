@@ -97,8 +97,6 @@ changes later.
 
 ## Next stages (not yet in this project)
 
-- Tune `TEST_CURRENT_MA` (currently a conservative 600mA) up to match your
-  NEMA17's actual rated current.
 - Acceleration/deceleration profiling for smoother, faster pose changes.
 - A richer command set (e.g. smooth interpolated moves between poses,
   rather than each leg independently racing to its own target at a fixed
