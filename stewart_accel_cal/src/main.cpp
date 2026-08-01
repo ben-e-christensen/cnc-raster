@@ -25,11 +25,11 @@
 //   A                        - one-shot raw accelerometer read: "ACCEL x y z"
 //                              (g's) or "ACCEL ERR".
 //   C                        - run the full calibration sweep (see below).
-//     Requires homing first. Drives through a grid of roll/pitch
-//     combinations (yaw is skipped - gravity alone can't observe yaw, so
-//     there's nothing for the accelerometer to check there), settling and
-//     averaging several accelerometer samples at each stop, and prints one
-//     line per pose:
+//     Requires homing first. Drives level, then out along a set of radial
+//     roll/pitch spokes from level (yaw is skipped - gravity alone can't
+//     observe yaw, so there's nothing for the accelerometer to check there),
+//     settling and averaging several accelerometer samples at each stop, and
+//     prints one line per pose:
 //       CAL <cmd_roll> <cmd_pitch> <cmd_yaw> <ax> <ay> <az> <n_good_samples>
 //     or, if that pose was unreachable:
 //       CAL_SKIP <cmd_roll> <cmd_pitch>
@@ -398,22 +398,63 @@ uint8_t sample_accel_avg(float &xg, float &yg, float &zg) {
 // have no springiness of their own, but the platform/rods/rig frame do.
 constexpr uint32_t CAL_SETTLE_DWELL_MS = 350;
 
-// Grid of test roll/pitch combinations. Yaw is intentionally not swept -
+// Radial sweep of test roll/pitch poses. Yaw is intentionally not swept -
 // gravity's direction doesn't change with yaw, so the accelerometer has
-// nothing to say about it. +-16deg stays inside the ~+-17.5deg reachable
-// envelope noted in kinematics.h with margin for combined roll+pitch corners
-// (corner poses like (16,16) may still miss and get CAL_SKIP'd - that's
-// fine, commit_pose() catches it and the sweep just moves on).
+// nothing to say about it.
 //
-// 17 values per axis (2deg steps, -16..16) -> 17*17 = 289 poses, close to
-// the ~300-stop resolution requested to get denser coverage than the
-// original 7x7=49 grid without needing continuous in-transit sampling
-// (which would require solving forward kinematics - angles back to pose -
-// which this firmware doesn't do; see README for why held-pose sampling
-// sidesteps that problem entirely).
-constexpr float CAL_ANGLE_MIN_DEG = -16.0f;
-constexpr float CAL_ANGLE_STEP_DEG = 2.0f;
-constexpr uint8_t CAL_N_ANGLES = 17;
+// The reachable envelope at NEUTRAL_Z is NOT a circle or a square - it's a
+// lobed, direction-dependent shape (offline probing of this exact geometry
+// found single-axis limits from ~11.5deg to ~16.5deg depending on which way
+// you tilt). A square roll/pitch grid sized to clear the worst-case
+// direction wastes most of its poses on the corners in every other
+// direction (this is why the old +-16deg, 2deg-step square grid skipped
+// 154/289 poses - more than half). Instead, walk outward from level along
+// CAL_N_DIRECTIONS spokes in CAL_RADIUS_STEP_DEG increments; the moment a
+// spoke's pose comes back unreachable, stop that spoke and move to the next
+// one, so every direction gets sampled out to its own real limit instead of
+// either the smallest shared limit or a fixed guess. This assumes the
+// envelope is star-shaped from level (no direction has an unreachable pose
+// closer to level than a reachable one further out) - confirmed by offline
+// probing of this geometry; if NEUTRAL_Z or the physical geometry changes
+// enough to break that assumption, a spoke would just stop short of its true
+// limit, not produce wrong data.
+constexpr uint8_t CAL_N_DIRECTIONS = 24;      // 15deg apart
+constexpr float CAL_RADIUS_STEP_DEG = 0.5f;
+constexpr float CAL_MAX_RADIUS_DEG = 20.0f;   // hard cap in case a spoke never reports unreachable
+
+// Drives to (roll, pitch), settles, and samples/logs one pose. Returns false
+// if the pose itself was unreachable (caller should stop walking this
+// spoke); returns true otherwise, including when the pose was reachable but
+// every accel sample at it failed (CAL_ERR) - that's a sampling problem, not
+// a reachability one, so the spoke keeps going.
+bool sample_cal_pose(float roll, float pitch) {
+    if (!set_target_pose(0, 0, 0, roll, pitch, 0)) {
+        Serial.print("CAL_SKIP ");
+        Serial.print(roll, 1); Serial.print(' '); Serial.println(pitch, 1);
+        return false;
+    }
+
+    drive_until_settled();
+    delay(CAL_SETTLE_DWELL_MS);
+
+    float ax, ay, az;
+    uint8_t n_good = sample_accel_avg(ax, ay, az);
+    if (n_good == 0) {
+        Serial.print("CAL_ERR ");
+        Serial.print(roll, 1); Serial.print(' '); Serial.println(pitch, 1);
+        return true;
+    }
+
+    Serial.print("CAL ");
+    Serial.print(roll, 1); Serial.print(' ');
+    Serial.print(pitch, 1); Serial.print(' ');
+    Serial.print(0.0f, 1); Serial.print(' '); // yaw, always 0 in this sweep
+    Serial.print(ax, 4); Serial.print(' ');
+    Serial.print(ay, 4); Serial.print(' ');
+    Serial.print(az, 4); Serial.print(' ');
+    Serial.println(n_good);
+    return true;
+}
 
 void run_calibration_sweep() {
     if (!homed) {
@@ -426,36 +467,15 @@ void run_calibration_sweep() {
     }
 
     Serial.println("CAL_START");
-    for (uint8_t ri = 0; ri < CAL_N_ANGLES; ri++) {
-        for (uint8_t pi = 0; pi < CAL_N_ANGLES; pi++) {
-            float roll = CAL_ANGLE_MIN_DEG + ri * CAL_ANGLE_STEP_DEG;
-            float pitch = CAL_ANGLE_MIN_DEG + pi * CAL_ANGLE_STEP_DEG;
 
-            if (!set_target_pose(0, 0, 0, roll, pitch, 0)) {
-                Serial.print("CAL_SKIP ");
-                Serial.print(roll, 1); Serial.print(' '); Serial.println(pitch, 1);
-                continue;
-            }
+    sample_cal_pose(0, 0); // level center, shared starting point for every spoke
 
-            drive_until_settled();
-            delay(CAL_SETTLE_DWELL_MS);
-
-            float ax, ay, az;
-            uint8_t n_good = sample_accel_avg(ax, ay, az);
-            if (n_good == 0) {
-                Serial.print("CAL_ERR ");
-                Serial.print(roll, 1); Serial.print(' '); Serial.println(pitch, 1);
-                continue;
-            }
-
-            Serial.print("CAL ");
-            Serial.print(roll, 1); Serial.print(' ');
-            Serial.print(pitch, 1); Serial.print(' ');
-            Serial.print(0.0f, 1); Serial.print(' '); // yaw, always 0 in this sweep
-            Serial.print(ax, 4); Serial.print(' ');
-            Serial.print(ay, 4); Serial.print(' ');
-            Serial.print(az, 4); Serial.print(' ');
-            Serial.println(n_good);
+    for (uint8_t di = 0; di < CAL_N_DIRECTIONS; di++) {
+        float theta = radians(di * (360.0f / CAL_N_DIRECTIONS));
+        for (float r = CAL_RADIUS_STEP_DEG; r <= CAL_MAX_RADIUS_DEG; r += CAL_RADIUS_STEP_DEG) {
+            float roll = r * cosf(theta);
+            float pitch = r * sinf(theta);
+            if (!sample_cal_pose(roll, pitch)) break; // out of reach - next spoke
         }
     }
 

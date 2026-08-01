@@ -85,11 +85,12 @@ def wait_for(ser, markers, error_markers, timeout):
 def run_home(ser, mode):
     cmd = "H" if mode == "H" else "Z"
     print(f"Homing ({cmd})...")
+    send(ser, cmd)
     ok, last = wait_for(ser, ["Ready."], ["ERROR", "ABORTED"], timeout=120)
     return ok
 
 
-def run_sweep(ser, rows, issues, timeout_s=600):
+def run_sweep(ser, rows, issues, timeout_s=1200):
     send(ser, "C")
     start = time.time()
     while time.time() - start < timeout_s:
