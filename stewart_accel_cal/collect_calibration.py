@@ -90,7 +90,7 @@ def run_home(ser, mode):
     return ok
 
 
-def run_sweep(ser, rows, issues, timeout_s=1200):
+def run_sweep(ser, rows, issues, timeout_s=2400):
     send(ser, "C")
     start = time.time()
     while time.time() - start < timeout_s:
@@ -103,6 +103,9 @@ def run_sweep(ser, rows, issues, timeout_s=1200):
             continue
         if line == "CAL_DONE":
             return True
+        if line.startswith("CAL_ABORT"):
+            print("[!] Firmware aborted the sweep (mid-sweep rehome failed).")
+            return False
         if line.startswith("CAL_SKIP"):
             parts = line.split()
             issues.append({"cmd_roll_deg": parts[1], "cmd_pitch_deg": parts[2],

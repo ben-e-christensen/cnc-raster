@@ -35,6 +35,12 @@
 //       CAL_SKIP <cmd_roll> <cmd_pitch>
 //     or, if every sample at a reachable pose failed:
 //       CAL_ERR <cmd_roll> <cmd_pitch>
+//     After each spoke, the platform returns to level and re-runs the hall
+//     auto-home search (see rehome_mid_sweep()) before starting the next
+//     spoke, to bound how far open-loop step loss can drift the whole run.
+//     If that mid-sweep rehome fails, the sweep aborts early with
+//     "CAL_ABORT" instead of "CAL_DONE" and homed state is cleared - rehome
+//     (Z/H) before sending another P, S, or C.
 //     Sweep starts with "CAL_START" and ends with "CAL_DONE" (after
 //     returning to neutral). Deliberately reports raw (ax,ay,az) rather
 //     than a computed roll/pitch: the MMA8451's mounting orientation
@@ -249,7 +255,9 @@ void hall_search_step(uint8_t leg, bool forward) {
     current_step_pos[leg] += forward ? 1 : -1;
 }
 
-void do_hall_auto_homing() {
+// Returns true if every leg was found and the platform reached level home;
+// false on any sensor error (caller must not assume homed/neutral state).
+bool do_hall_auto_homing() {
     Serial.println("Auto-homing via hall sensors - finding true vertical, all legs together...");
 
     HallSearchState state[NUM_LEGS];
@@ -336,12 +344,13 @@ void do_hall_auto_homing() {
     for (uint8_t i = 0; i < NUM_LEGS; i++) {
         if (state[i] == HS_ERROR) {
             Serial.println("Auto-homing ABORTED. Fix the flagged leg(s) and try again.");
-            return;
+            return false;
         }
     }
 
     Serial.println("All six legs centered on their magnets. Driving to level home...");
     drive_to_level_home_from_vertical();
+    return true;
 }
 
 // Raw, error-checked accelerometer read (see ../octo/src/main.cpp for why
@@ -456,6 +465,19 @@ bool sample_cal_pose(float roll, float pitch) {
     return true;
 }
 
+// Returns to level and re-runs the hall auto-home search. The sweep is
+// open-loop stepping with no per-leg position feedback between homes - each
+// spoke walks out to its limit and back dozens of times, and a single
+// missed step anywhere silently offsets every pose after it for the rest of
+// the sweep with no way to tell from the logged data alone. Re-anchoring to
+// the physical hall sensors after every spoke bounds how much drift can
+// accumulate to "at most one spoke's worth" instead of "the whole sweep".
+bool rehome_mid_sweep() {
+    set_target_pose(0, 0, 0, 0, 0, 0);
+    drive_until_settled();
+    return do_hall_auto_homing();
+}
+
 void run_calibration_sweep() {
     if (!homed) {
         Serial.println("Not homed yet - send Z or H first.");
@@ -477,10 +499,14 @@ void run_calibration_sweep() {
             float pitch = r * sinf(theta);
             if (!sample_cal_pose(roll, pitch)) break; // out of reach - next spoke
         }
+
+        if (!rehome_mid_sweep()) {
+            Serial.println("CAL_ABORT rehoming failed mid-sweep - fix the flagged leg and rerun.");
+            homed = false; // hall search left position tracking in an unknown state
+            return;
+        }
     }
 
-    set_target_pose(0, 0, 0, 0, 0, 0);
-    drive_until_settled();
     Serial.println("CAL_DONE");
 }
 

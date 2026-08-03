@@ -66,6 +66,15 @@ the details, they're not repeated here.
   move time between adjacent 2deg poses) comes out to roughly 3 minutes
   total.
 
+  The sweep is open-loop stepping with no per-leg position feedback except
+  at a home - a single missed step anywhere would otherwise silently offset
+  every pose logged after it for the rest of the run. To bound that, the
+  platform returns to level and re-runs the hall auto-home search after
+  every spoke before continuing. If that mid-sweep rehome fails (a leg's
+  hall sensor problem), the sweep aborts early with `CAL_ABORT` instead of
+  `CAL_DONE`, and you need to home again (`Z`/`H`) before sending another
+  command.
+
   **Why stop-and-sample instead of continuous readings during travel:**
   the firmware bit-bangs every step pulse itself, so it always knows each
   leg's exact crank angle - but converting six independent, asynchronously
